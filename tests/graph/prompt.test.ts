@@ -118,3 +118,74 @@ describe("interpolatePromptVars — wrap (preview highlight)", () => {
     );
   });
 });
+
+
+describe("deterministic response policy", () => {
+  const systemPrompt =
+    "# TRAVAS DE REGRESSÃO DA IDENTIFICAÇÃO E RESPOSTA";
+
+  test("asks for a name before a non-urgent substantive answer", () => {
+    expect(
+      requiredNameReply({
+        systemPrompt,
+        contactName: null,
+        customerMessage: "Quanto tempo dura a consulta?",
+      }),
+    ).toBe("Para eu cuidar melhor do seu atendimento, qual é o seu nome?");
+  });
+
+  test("accepts a name supplied in the current message", () => {
+    expect(explicitNameFromMessage("Meu nome é Ana. Quero agendar.")).toBe(
+      "Ana",
+    );
+    expect(
+      requiredNameReply({
+        systemPrompt,
+        contactName: null,
+        customerMessage: "Meu nome é Ana. Quero agendar.",
+      }),
+    ).toBeNull();
+  });
+
+  test("does not delay urgent safety guidance to ask for a name", () => {
+    expect(
+      requiredNameReply({
+        systemPrompt,
+        contactName: null,
+        customerMessage: "Estou passando mal e tive efeito colateral.",
+      }),
+    ).toBeNull();
+  });
+
+  test("deduplicates an exactly repeated reply", () => {
+    const line =
+      "Daniel, hoje estamos com todas as vagas preenchidas. Posso verificar a partir de amanhã?";
+    expect(
+      applyDeterministicResponsePolicy({
+        systemPrompt,
+        reply: `${line}\n${line}`,
+      }).reply,
+    ).toBe(line);
+  });
+
+  test("removes knowledge internals and requests handoff", () => {
+    const result = applyDeterministicResponsePolicy({
+      systemPrompt,
+      reply:
+        "Paula, a nossa base não traz essa informação. Vou repassar sua dúvida para nossa equipe. Um responsável poderá responder em até 24 horas.",
+    });
+    expect(result.reply).not.toContain("base");
+    expect(result.reply).toContain("Vou repassar");
+    expect(result.requiresHandoff).toBe(true);
+  });
+
+  test("is inert for agents without the explicit marker", () => {
+    const reply = "A base não informa. A base não informa.";
+    expect(
+      applyDeterministicResponsePolicy({
+        systemPrompt: "Outro agente",
+        reply,
+      }),
+    ).toEqual({ reply, requiresHandoff: false });
+  });
+});
