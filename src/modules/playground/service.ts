@@ -486,7 +486,7 @@ export async function runPlaygroundTurn(
       id,
       name: "handoff_to_human",
       output:
-        "[simulated] automatic handoff — no real effect in the playground.",
+        "[simulated] automatic handoff - no real effect in the playground.",
       isError: false,
       simulated: true,
     });
