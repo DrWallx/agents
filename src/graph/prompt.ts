@@ -43,7 +43,7 @@ const KNOWLEDGE_INTERNAL =
 const MISSING_KNOWLEDGE =
   /\b(?:n[aã]o (?:traz|tem|informa|consta|encontr)|sem informa[cç][aã]o|aus[eê]ncia de informa[cç][aã]o)\b/i;
 const HANDOFF_PROMISE =
-  /\b(?:vou|irei)\s+(?:repassar|encaminhar).{0,160}\bequipe\b|\bequipe\b.{0,160}\b(?:responder|continuar|dar continuidade)\b/is;
+  /\b(?:vou|irei)\s+(?:repassar|encaminhar|confirmar|verificar|consultar).{0,160}\bequipe\b|\bequipe\b.{0,160}\b(?:responder|continuar|dar continuidade|retornar|confirmar|verificar)\b/is;
 
 export function usesDeterministicResponsePolicy(
   systemPrompt: string,
