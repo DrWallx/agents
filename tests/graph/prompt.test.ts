@@ -185,6 +185,15 @@ describe("deterministic response policy", () => {
     expect(result.requiresHandoff).toBe(true);
   });
 
+  test("requests handoff when the reply promises to confirm with the team", () => {
+    const result = applyDeterministicResponsePolicy({
+      systemPrompt,
+      reply:
+        "Carlos, vou confirmar com a equipe e te retorno em até 24 horas.",
+    });
+    expect(result.requiresHandoff).toBe(true);
+  });
+
   test("is inert for agents without the explicit marker", () => {
     const reply = "A base não informa. A base não informa.";
     expect(
