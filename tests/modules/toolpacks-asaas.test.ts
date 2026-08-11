@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { randomBytes } from "node:crypto";
+import type { ToolMessage } from "@langchain/core/messages";
 import { PrismaPg } from "@prisma/adapter-pg";
 import { PrismaClient } from "@/../generated/prisma/client";
 import { getMapper } from "@/modules/integrations/mappers";
@@ -298,6 +299,77 @@ describe("asaas toolpack — PIX charge (hermetic)", () => {
     })) as string;
     expect(out).toContain("https://sandbox.asaas.com/i/pix1");
   });
+
+  // NOTE: Issue #46 — a side effect that fails inside a tool that still returns success must reach
+  // ctx.onSideEffectError (prepare.ts surfaces it as a flowlog warn). The model-facing return value
+  // never changes.
+  test("a failed correlation-ref persist reports the side effect but still returns the charge", async () => {
+    const { impl } = scriptedFetch(pixRoutes({ data: [], totalCount: 0 }));
+    const effects: Array<{ tool: string; phase: string; err: unknown }> = [];
+    // base is undefined in this pure ctx, so the scoped write throws — the exact orphan-ref path.
+    const tool = pixTool(
+      baseCtx({ fetchImpl: impl, onSideEffectError: (e) => effects.push(e) }),
+    );
+    const out = (await tool?.invoke({
+      value: 10,
+      customerName: "Zé",
+      cpfCnpj: CPF,
+    })) as string;
+    expect(out).toContain("00020126PIXCOPYPASTE6304ABCD");
+    const persist = effects.find((e) => e.phase === "persist_ref");
+    expect(persist?.tool).toBe("asaas_create_pix_charge");
+    expect(persist?.err).toBeDefined();
+  });
+
+  test("a non-2xx pixQrCode response reports the side effect (it never threw, so it used to vanish)", async () => {
+    // Replace the QR route by its own match predicate, independent of pixRoutes ordering.
+    const routes = pixRoutes({ data: [], totalCount: 0 }).map((r) =>
+      r.match("/payments/pay_pix_1/pixQrCode", { method: "GET" })
+        ? { ...r, status: 500, json: {} }
+        : r,
+    );
+    const { impl } = scriptedFetch(routes);
+    const effects: Array<{ tool: string; phase: string; err: unknown }> = [];
+    const tool = pixTool(
+      baseCtx({ fetchImpl: impl, onSideEffectError: (e) => effects.push(e) }),
+    );
+    const out = (await tool?.invoke({
+      value: 10,
+      customerName: "Y",
+      cpfCnpj: CPF,
+    })) as string;
+    // Still a success for the model: the charge exists and the page is payable.
+    expect(out).toContain("https://sandbox.asaas.com/i/pix1");
+    const qr = effects.find((e) => e.phase === "pix_qr");
+    expect(qr?.tool).toBe("asaas_create_pix_charge");
+    expect(String(qr?.err)).toContain("500");
+  });
+
+  test("a failed correlation-ref persist on payment link reports the side effect but still returns the link", async () => {
+    const { impl } = stubFetch(200, {
+      id: "plink_9",
+      url: "https://sandbox.asaas.com/i/l9",
+    });
+    const effects: Array<{
+      tool: string;
+      phase: string;
+      detail?: Record<string, unknown>;
+    }> = [];
+    const tool = asaasToolpack.build(
+      sel({
+        enabledTools: ["asaas_payment_link_create"],
+        config: { environment: "sandbox" },
+      }),
+      baseCtx({ fetchImpl: impl, onSideEffectError: (e) => effects.push(e) }),
+    )[0];
+    const out = (await tool?.invoke({
+      value: 25,
+      description: "Plano",
+    })) as string;
+    expect(out).toContain("https://sandbox.asaas.com/i/l9");
+    expect(effects.map((e) => e.phase)).toEqual(["persist_ref"]);
+    expect(effects[0]?.tool).toBe("asaas_payment_link_create");
+  });
 });
 
 // ── DB-gated: the create tool persists the correlation ref ──
@@ -474,5 +546,112 @@ describe.skipIf(!dbUp)("asaas toolpack — correlation ref persistence", () => {
     expect((ref?.metadata as Record<string, unknown>)?.paymentId).toBe(
       "pay_db_1",
     );
+  });
+});
+
+// NOTE: Integration failures must reach the flow log as failures (issue #40): invoked as a
+// tool_call, a missing credential returns a ToolMessage with status "error"; bad model input
+// (invalid CPF) stays a plain success — normal operation, not an outage.
+describe("asaas toolpack — integration failures are marked (issue #40)", () => {
+  test("missing credential returns ToolMessage status error", async () => {
+    const { impl, calls } = stubFetch(200, {});
+    const tool = asaasToolpack.build(
+      sel({ enabledTools: ["asaas_payment_status"], credentialRef: null }),
+      baseCtx({ fetchImpl: impl }),
+    )[0];
+    const out = (await tool?.invoke({
+      type: "tool_call",
+      id: "call_as_1",
+      name: "asaas_payment_status",
+      args: { paymentLinkId: "plink_1" },
+    })) as ToolMessage;
+    expect(out.status).toBe("error");
+    expect(String(out.content)).toContain("not configured");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a rejected customer lookup fails the call — no duplicate customer POST", async () => {
+    const { impl, calls } = scriptedFetch([
+      {
+        match: (u, i) =>
+          u.includes("/customers?cpfCnpj=") && i.method === "GET",
+        status: 500,
+        json: { error: "boom" },
+      },
+    ]);
+    const tool = asaasToolpack.build(
+      sel({
+        enabledTools: ["asaas_create_pix_charge"],
+        config: { environment: "sandbox" },
+      }),
+      baseCtx({ fetchImpl: impl }),
+    )[0];
+    const out = (await tool?.invoke({
+      type: "tool_call",
+      id: "call_as_3",
+      name: "asaas_create_pix_charge",
+      args: { value: 10, customerName: "X", cpfCnpj: "12345678909" },
+    })) as ToolMessage;
+    expect(out.status).toBe("error");
+    expect(String(out.content)).toContain("customer lookup (HTTP 500)");
+    // NOTE: Exactly ONE request (the lookup): the create branch must never run on a rejected lookup.
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init.method).toBe("GET");
+  });
+
+  test("a malformed 2xx lookup body fails the call — no duplicate customer POST", async () => {
+    // NOTE: Malformed shapes a 2xx can carry: no data array at all, a non-empty data array whose
+    // first customer has no string id, and a blank id (customerId would stay falsy and reach the
+    // create branch). Any of them falling through would POST a duplicate customer.
+    for (const body of [
+      {},
+      { data: [{ nome: "sem id" }] },
+      { data: [{ id: "   " }] },
+    ]) {
+      const { impl, calls } = scriptedFetch([
+        {
+          match: (u, i) =>
+            u.includes("/customers?cpfCnpj=") && i.method === "GET",
+          status: 200,
+          json: body,
+        },
+      ]);
+      const tool = asaasToolpack.build(
+        sel({
+          enabledTools: ["asaas_create_pix_charge"],
+          config: { environment: "sandbox" },
+        }),
+        baseCtx({ fetchImpl: impl }),
+      )[0];
+      const out = (await tool?.invoke({
+        type: "tool_call",
+        id: "call_as_4",
+        name: "asaas_create_pix_charge",
+        args: { value: 10, customerName: "X", cpfCnpj: "12345678909" },
+      })) as ToolMessage;
+      expect(out.status).toBe("error");
+      expect(String(out.content)).toContain("unexpected response");
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.init.method).toBe("GET");
+    }
+  });
+
+  test("an invalid CPF (model input) is NOT marked as a failure", async () => {
+    const { impl, calls } = stubFetch(200, {});
+    const tool = asaasToolpack.build(
+      sel({
+        enabledTools: ["asaas_create_pix_charge"],
+        config: { environment: "sandbox" },
+      }),
+      baseCtx({ fetchImpl: impl }),
+    )[0];
+    const out = (await tool?.invoke({
+      type: "tool_call",
+      id: "call_as_2",
+      name: "asaas_create_pix_charge",
+      args: { value: 10, customerName: "X", cpfCnpj: "123" },
+    })) as ToolMessage;
+    expect(out.status).toBe("success");
+    expect(calls).toHaveLength(0);
   });
 });

@@ -1,6 +1,7 @@
-import { type StructuredToolInterface, tool } from "@langchain/core/tools";
+import type { StructuredToolInterface } from "@langchain/core/tools";
 import { z } from "zod";
 import logger from "@/api/lib/logger";
+import { failableTool, toolFailure } from "@/graph/tools/failure";
 import { assertSafeOutboundUrl } from "@/lib/ssrf";
 import { xmlAttr } from "@/lib/xml";
 import { readAppointmentReminderConfig } from "@/modules/appointments/settings";
@@ -91,6 +92,14 @@ function resolveBlockingCalendarIds(config: Record<string, unknown>): string[] {
     .map((v) => v.trim())
     .filter((v) => v.length > 0);
   return Array.from(new Set(ids));
+}
+
+// NOTE: whether calendar_create_event asks Google for a Meet room. ON by default: an agent that books a
+// "call" must hand the customer a real meeting room, not the calendar page (htmlLink). Operators who
+// use the calendar purely as a busy-block turn it off in the integration config. When the connected
+// account cannot create Meet rooms, Google keeps the event and just omits the conference (no error).
+function resolveCreateMeetLink(config: Record<string, unknown>): boolean {
+  return config.createMeetLink !== false;
 }
 
 // Friendly labels (calendar id → human name, e.g. "Dr. Ana"), captured when the operator picks
@@ -440,6 +449,9 @@ function projectEvent(ev: Record<string, unknown>) {
     start: flattenTime(ev.start),
     end: flattenTime(ev.end),
     htmlLink: typeof ev.htmlLink === "string" ? ev.htmlLink : undefined,
+    // NOTE: the Meet room (hangoutLink) — THE link to hand the customer; htmlLink is only the event's
+    // calendar page, useless to a lead without access to the calendar.
+    meetLink: typeof ev.hangoutLink === "string" ? ev.hangoutLink : undefined,
   };
 }
 
@@ -565,7 +577,7 @@ function buildListEventsTool(
 ): StructuredToolInterface {
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
-  return tool(
+  return failableTool(
     async (input: {
       timeMin?: string;
       timeMax?: string;
@@ -575,7 +587,7 @@ function buildListEventsTool(
       const stamp = contactStamp(ctx);
       if (!stamp) return NO_CONTACT;
       const token = await resolveToken(sel, ctx);
-      if (!token) return NOT_CONNECTED;
+      if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
@@ -599,10 +611,12 @@ function buildListEventsTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: list events request failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (res.status < 200 || res.status >= 300) {
-        return `Google Calendar returned HTTP ${res.status}.`;
+        return toolFailure(`Google Calendar returned HTTP ${res.status}.`);
       }
       const data = (res.json ?? {}) as Record<string, unknown>;
       const items = Array.isArray(data.items) ? data.items : [];
@@ -643,7 +657,7 @@ function buildCheckAvailabilityTool(
   const businessHoursId = resolveBusinessHoursId(sel.config);
   const minLeadMinutes = resolveMinLead(sel.config);
   const blockingIds = resolveBlockingCalendarIds(sel.config);
-  return tool(
+  return failableTool(
     async (input: {
       timeMin: string;
       timeMax: string;
@@ -660,7 +674,7 @@ function buildCheckAvailabilityTool(
         return "Please search at most 24 hours at a time. Narrow the range to a single day and call again for other days.";
       }
       const token = await resolveToken(sel, ctx);
-      if (!token) return NOT_CONNECTED;
+      if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
@@ -679,10 +693,12 @@ function buildCheckAvailabilityTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: freeBusy request failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (res.status < 200 || res.status >= 300) {
-        return `Google Calendar returned HTTP ${res.status}.`;
+        return toolFailure(`Google Calendar returned HTTP ${res.status}.`);
       }
       const data = (res.json ?? {}) as Record<string, unknown>;
       const calendars = (data.calendars ?? {}) as Record<string, unknown>;
@@ -722,11 +738,15 @@ function buildCheckAvailabilityTool(
           );
         } catch (err) {
           logger.warn({ err }, "gcal: blocking calendars request failed");
-          return "Failed to read a blocking calendar (holidays/closures), so availability cannot be verified right now. Try again shortly.";
+          return toolFailure(
+            "Failed to read a blocking calendar (holidays/closures), so availability cannot be verified right now. Try again shortly.",
+          );
         }
         for (const r of blockingRes) {
           if (r.status < 200 || r.status >= 300) {
-            return `Google Calendar returned HTTP ${r.status} for a blocking calendar, so availability cannot be verified right now.`;
+            return toolFailure(
+              `Google Calendar returned HTTP ${r.status} for a blocking calendar, so availability cannot be verified right now.`,
+            );
           }
           const evData = (r.json ?? {}) as Record<string, unknown>;
           // A nextPageToken means the window holds more events than the cap covers; treating the
@@ -790,7 +810,8 @@ function buildCreateEventTool(
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
   const timeZone = resolveTimeZone(sel.config);
-  return tool(
+  const meetEnabled = resolveCreateMeetLink(sel.config);
+  return failableTool(
     async (input: {
       summary: string;
       start: string;
@@ -801,7 +822,7 @@ function buildCreateEventTool(
       const stamp = contactStamp(ctx);
       if (!stamp) return NO_CONTACT;
       const token = await resolveToken(sel, ctx);
-      if (!token) return NOT_CONNECTED;
+      if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
@@ -812,24 +833,65 @@ function buildCreateEventTool(
         ...(input.description ? { description: input.description } : {}),
         // Owner stamp injected from context, never from the model: locks this appointment to the contact.
         extendedProperties: { private: { [SECV4_CONTACT_KEY]: stamp } },
+        // NOTE: a Meet room for the appointment. requestId MUST be unique per event: Google returns the
+        // SAME room for a reused id, which would put different leads in one meeting.
+        ...(meetEnabled
+          ? {
+              conferenceData: {
+                createRequest: {
+                  requestId: crypto.randomUUID(),
+                  conferenceSolutionKey: { type: "hangoutsMeet" },
+                },
+              },
+            }
+          : {}),
       };
       let res: GcalResponse;
       try {
         res = await gcalFetch(
-          `/calendars/${encodeURIComponent(calendarId)}/events`,
+          // NOTE: without conferenceDataVersion=1 the API IGNORES conferenceData in silence — no error,
+          // no room. Easy to lose in a refactor; pinned by tests.
+          `/calendars/${encodeURIComponent(calendarId)}/events${meetEnabled ? "?conferenceDataVersion=1" : ""}`,
           { method: "POST", token, body },
           ctx,
         );
       } catch (err) {
         logger.warn({ err }, "gcal: create event request failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (res.status < 200 || res.status >= 300) {
-        return `Google Calendar rejected the event (HTTP ${res.status}).`;
+        return toolFailure(
+          `Google Calendar rejected the event (HTTP ${res.status}).`,
+        );
       }
-      const data = (res.json ?? {}) as Record<string, unknown>;
+      let data = (res.json ?? {}) as Record<string, unknown>;
       if (typeof data.id !== "string") {
-        return "Google Calendar returned an unexpected response.";
+        return toolFailure("Google Calendar returned an unexpected response.");
+      }
+      const eventId = data.id;
+      // NOTE: room creation is usually synchronous, but the API may answer with the createRequest still
+      // pending and no hangoutLink; one cheap re-read closes that gap (no polling — if it is STILL
+      // pending, the reply simply carries no meetLink and the event stands).
+      if (meetEnabled && typeof data.hangoutLink !== "string") {
+        try {
+          const re = await gcalFetch(
+            `/calendars/${encodeURIComponent(calendarId)}/events/${encodeURIComponent(eventId)}`,
+            { method: "GET", token },
+            ctx,
+          );
+          const rec = (re.json ?? {}) as Record<string, unknown>;
+          if (
+            re.status >= 200 &&
+            re.status < 300 &&
+            typeof rec.hangoutLink === "string"
+          ) {
+            data = rec;
+          }
+        } catch (err) {
+          logger.warn({ err }, "gcal: meet-link re-read failed");
+        }
       }
       // Arm deterministic reminders for the new appointment (best-effort; no-op when the Calendar
       // integration has reminders disabled / on the playground). The policy (offsets/confirmation) is
@@ -838,12 +900,15 @@ function buildCreateEventTool(
       const apptCfg = readAppointmentReminderConfig(sel.config);
       if (apptCfg.enabled && ctx.scheduleAppointmentReminders && startISO) {
         await ctx.scheduleAppointmentReminders({
-          eventId: data.id,
+          eventId,
           calendarId,
           startISO,
           credentialRef: sel.credentialRef,
           offsetsHours: apptCfg.offsetsHours,
           askConfirmationOnLast: apptCfg.askConfirmationOnLast,
+          summary:
+            typeof data.summary === "string" ? data.summary : input.summary,
+          calendarLabel: labels[calendarId] ?? null,
         });
       }
       return JSON.stringify(projectEvent(data));
@@ -851,7 +916,7 @@ function buildCreateEventTool(
     {
       name: "calendar_create_event",
       description: withCalendarContext(
-        `Create an appointment for THIS customer on the calendar (it is automatically tagged to this customer, so only they can later see or change it). Provide a summary plus start and end. Use ISO 8601 with an offset for timed events (e.g. 2026-06-20T14:00:00-03:00) or a bare date (2026-06-20) for an all-day event. Returns the created appointment's id and link.`,
+        `Create an appointment for THIS customer on the calendar (it is automatically tagged to this customer, so only they can later see or change it). Provide a summary plus start and end. Use ISO 8601 with an offset for timed events (e.g. 2026-06-20T14:00:00-03:00) or a bare date (2026-06-20) for an all-day event. Returns the created appointment's id and links${meetEnabled ? "; share meetLink (the Google Meet room) with the customer — htmlLink is only the calendar page" : ""}.`,
         allowedCalendarsXml(allowed, labels),
       ),
       schema: CREATE_EVENT_SCHEMA,
@@ -866,7 +931,7 @@ function buildUpdateEventTool(
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
   const timeZone = resolveTimeZone(sel.config);
-  return tool(
+  return failableTool(
     async (input: {
       eventId: string;
       summary?: string;
@@ -878,7 +943,7 @@ function buildUpdateEventTool(
       const stamp = contactStamp(ctx);
       if (!stamp) return NO_CONTACT;
       const token = await resolveToken(sel, ctx);
-      if (!token) return NOT_CONNECTED;
+      if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
@@ -903,11 +968,13 @@ function buildUpdateEventTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: update ownership check failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (owner.status === 404) return FOREIGN_EVENT;
       if (owner.status < 200 || owner.status >= 300) {
-        return `Google Calendar returned HTTP ${owner.status}.`;
+        return toolFailure(`Google Calendar returned HTTP ${owner.status}.`);
       }
       const ownerEv = (owner.json ?? {}) as Record<string, unknown>;
       if (eventStamp(ownerEv) !== stamp) return FOREIGN_EVENT;
@@ -920,10 +987,14 @@ function buildUpdateEventTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: update event request failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (res.status < 200 || res.status >= 300) {
-        return `Google Calendar rejected the update (HTTP ${res.status}).`;
+        return toolFailure(
+          `Google Calendar rejected the update (HTTP ${res.status}).`,
+        );
       }
       const data = (res.json ?? {}) as Record<string, unknown>;
       // A reschedule (start changed) re-arms reminders against the new time: cancel the old ones, then
@@ -945,6 +1016,11 @@ function buildUpdateEventTool(
             credentialRef: sel.credentialRef,
             offsetsHours: apptCfg.offsetsHours,
             askConfirmationOnLast: apptCfg.askConfirmationOnLast,
+            summary:
+              typeof data.summary === "string"
+                ? data.summary
+                : (input.summary ?? null),
+            calendarLabel: labels[calendarId] ?? null,
           });
         }
       }
@@ -967,12 +1043,12 @@ function buildCancelEventTool(
 ): StructuredToolInterface {
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
-  return tool(
+  return failableTool(
     async (input: { eventId: string; calendarId?: string }) => {
       const stamp = contactStamp(ctx);
       if (!stamp) return NO_CONTACT;
       const token = await resolveToken(sel, ctx);
-      if (!token) return NOT_CONNECTED;
+      if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
@@ -987,11 +1063,13 @@ function buildCancelEventTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: cancel ownership check failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (owner.status === 404) return FOREIGN_EVENT;
       if (owner.status < 200 || owner.status >= 300) {
-        return `Google Calendar returned HTTP ${owner.status}.`;
+        return toolFailure(`Google Calendar returned HTTP ${owner.status}.`);
       }
       const ownerEv = (owner.json ?? {}) as Record<string, unknown>;
       if (eventStamp(ownerEv) !== stamp) return FOREIGN_EVENT;
@@ -1004,12 +1082,16 @@ function buildCancelEventTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: cancel event request failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       // 204 No Content is the success shape; 410 Gone means it was already cancelled (idempotent).
       if (res.status === 410) return "The appointment was already cancelled.";
       if (res.status !== 204 && (res.status < 200 || res.status >= 300)) {
-        return `Google Calendar rejected the cancellation (HTTP ${res.status}).`;
+        return toolFailure(
+          `Google Calendar rejected the cancellation (HTTP ${res.status}).`,
+        );
       }
       // Drop any pending reminders for this appointment (best-effort).
       await ctx.cancelAppointmentReminders?.(input.eventId);
@@ -1032,12 +1114,12 @@ function buildConfirmAppointmentTool(
 ): StructuredToolInterface {
   const allowed = resolveAllowedCalendarIds(sel.config);
   const labels = resolveCalendarLabels(sel.config);
-  return tool(
+  return failableTool(
     async (input: { eventId: string; calendarId?: string }) => {
       const stamp = contactStamp(ctx);
       if (!stamp) return NO_CONTACT;
       const token = await resolveToken(sel, ctx);
-      if (!token) return NOT_CONNECTED;
+      if (!token) return toolFailure(NOT_CONNECTED);
       const pick = pickCalendarId(allowed, labels, input.calendarId);
       if ("error" in pick) return pick.error;
       const calendarId = pick.id;
@@ -1051,11 +1133,13 @@ function buildConfirmAppointmentTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: confirm ownership check failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (owner.status === 404) return FOREIGN_EVENT;
       if (owner.status < 200 || owner.status >= 300) {
-        return `Google Calendar returned HTTP ${owner.status}.`;
+        return toolFailure(`Google Calendar returned HTTP ${owner.status}.`);
       }
       const ownerEv = (owner.json ?? {}) as Record<string, unknown>;
       if (eventStamp(ownerEv) !== stamp) return FOREIGN_EVENT;
@@ -1085,10 +1169,14 @@ function buildConfirmAppointmentTool(
         );
       } catch (err) {
         logger.warn({ err }, "gcal: confirm event request failed");
-        return "Failed to reach Google Calendar. Try again shortly.";
+        return toolFailure(
+          "Failed to reach Google Calendar. Try again shortly.",
+        );
       }
       if (res.status < 200 || res.status >= 300) {
-        return `Google Calendar rejected the confirmation (HTTP ${res.status}).`;
+        return toolFailure(
+          `Google Calendar rejected the confirmation (HTTP ${res.status}).`,
+        );
       }
       return "The appointment was marked as confirmed.";
     },

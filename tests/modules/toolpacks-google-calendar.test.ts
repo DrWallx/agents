@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { ToolMessage } from "@langchain/core/messages";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import { googleCalendarToolpack } from "@/modules/integrations/toolpacks/google-calendar";
 import type {
@@ -1020,5 +1021,180 @@ describe("google calendar toolpack — blocking calendars (issue #1)", () => {
     const tool = toolFor("calendar_list_events", {}, baseCtx());
     expect(tool?.description).toContain("does NOT mean the calendar is free");
     expect(tool?.description).toContain("calendar_check_availability");
+  });
+});
+
+// NOTE: a booked "call" must hand the customer a real meeting room: without conferenceData the model only
+// ever gets htmlLink, the calendar PAGE of the event. Two API traps pinned here: the Google API
+// honors conferenceData only when the request carries conferenceDataVersion=1 (silently ignored
+// otherwise), and createRequest.requestId must be unique per event (a reused id returns the SAME
+// room, so different leads would share a meeting).
+describe("google calendar toolpack — Meet room on create", () => {
+  const CREATED = {
+    id: "ev9",
+    summary: "Demo",
+    start: { dateTime: "2026-08-10T14:00:00-03:00" },
+    end: { dateTime: "2026-08-10T15:00:00-03:00" },
+    htmlLink: "https://cal/ev9",
+    hangoutLink: "https://meet.google.com/abc-defg-hij",
+  };
+  const INPUT = {
+    summary: "Demo",
+    start: "2026-08-10T14:00:00-03:00",
+    end: "2026-08-10T15:00:00-03:00",
+  };
+
+  test("create asks Google for a Meet room by default (body + conferenceDataVersion=1)", async () => {
+    const { impl, calls } = stubFetch(200, CREATED);
+    await toolFor(
+      "calendar_create_event",
+      {},
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(INPUT);
+    expect(calls[0]?.url).toContain("conferenceDataVersion=1");
+    const body = bodyOf(calls[0] as { init: RequestInit });
+    const conf = body.conferenceData as {
+      createRequest?: {
+        requestId?: string;
+        conferenceSolutionKey?: { type?: string };
+      };
+    };
+    expect(conf?.createRequest?.conferenceSolutionKey?.type).toBe(
+      "hangoutsMeet",
+    );
+    expect(typeof conf?.createRequest?.requestId).toBe("string");
+  });
+
+  test("each create uses a fresh requestId", async () => {
+    const { impl, calls } = stubFetch(200, CREATED);
+    const tool = toolFor(
+      "calendar_create_event",
+      {},
+      baseCtx({ fetchImpl: impl }),
+    );
+    await tool?.invoke(INPUT);
+    await tool?.invoke(INPUT);
+    const rid = (i: number) =>
+      (
+        bodyOf(calls[i] as { init: RequestInit }).conferenceData as {
+          createRequest?: { requestId?: string };
+        }
+      )?.createRequest?.requestId;
+    expect(rid(0)).toBeTruthy();
+    expect(rid(1)).toBeTruthy();
+    expect(rid(0)).not.toBe(rid(1));
+  });
+
+  test("the returned event exposes meetLink (hangoutLink), the link to hand the customer", async () => {
+    const { impl } = stubFetch(200, CREATED);
+    const out = (await toolFor(
+      "calendar_create_event",
+      {},
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(INPUT)) as string;
+    expect(JSON.parse(out)).toMatchObject({
+      id: "ev9",
+      meetLink: "https://meet.google.com/abc-defg-hij",
+    });
+  });
+
+  test("createMeetLink: false keeps today's body and URL (calendar as a pure busy-block)", async () => {
+    const { impl, calls } = stubFetch(200, { id: "ev9" });
+    await toolFor(
+      "calendar_create_event",
+      { createMeetLink: false },
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(INPUT);
+    expect(calls[0]?.url).not.toContain("conferenceDataVersion");
+    expect(
+      bodyOf(calls[0] as { init: RequestInit }).conferenceData,
+    ).toBeUndefined();
+  });
+
+  test("a pending room is re-read once so the reply still carries meetLink", async () => {
+    // NOTE: the POST answers without hangoutLink (createRequest still pending); one follow-up GET has it.
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const responses: unknown[] = [
+      {
+        ...CREATED,
+        hangoutLink: undefined,
+        conferenceData: {
+          createRequest: { status: { statusCode: "pending" } },
+        },
+      },
+      CREATED,
+    ];
+    let n = 0;
+    const impl = (async (url: string | URL | Request, init?: RequestInit) => {
+      calls.push({ url: String(url), init: init ?? {} });
+      const body = responses[Math.min(n, responses.length - 1)];
+      n += 1;
+      return new Response(JSON.stringify(body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as unknown as typeof fetch;
+    const out = (await toolFor(
+      "calendar_create_event",
+      {},
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke(INPUT)) as string;
+    expect(calls).toHaveLength(2);
+    expect(calls[1]?.init.method).toBe("GET");
+    expect(JSON.parse(out)).toMatchObject({
+      meetLink: "https://meet.google.com/abc-defg-hij",
+    });
+  });
+});
+
+// NOTE: Integration failures must reach the flow log as failures (issue #40): invoked as a
+// tool_call, a provider/credential failure returns a ToolMessage with status "error" (same friendly
+// content), while bad model input stays a plain success — it is normal operation, not an outage.
+describe("google calendar toolpack — integration failures are marked (issue #40)", () => {
+  test("a non-2xx and a missing credential return ToolMessage status error", async () => {
+    const { impl } = stubFetch(500, { error: "boom" });
+    const http = (await toolFor(
+      "calendar_list_events",
+      {},
+      baseCtx({ fetchImpl: impl }),
+    )?.invoke({
+      type: "tool_call",
+      id: "call_cal_1",
+      name: "calendar_list_events",
+      args: {},
+    })) as ToolMessage;
+    expect(http.status).toBe("error");
+    expect(String(http.content)).toContain("500");
+
+    const notConnected = (await toolFor(
+      "calendar_list_events",
+      {},
+      baseCtx({ resolveCredential: async () => null }),
+    )?.invoke({
+      type: "tool_call",
+      id: "call_cal_2",
+      name: "calendar_list_events",
+      args: {},
+    })) as ToolMessage;
+    expect(notConnected.status).toBe("error");
+    expect(String(notConnected.content)).toContain("not connected");
+  });
+
+  test("bad model input (range over 24h) is NOT marked as a failure", async () => {
+    const out = (await toolFor(
+      "calendar_check_availability",
+      {},
+      baseCtx(),
+    )?.invoke({
+      type: "tool_call",
+      id: "call_cal_3",
+      name: "calendar_check_availability",
+      args: {
+        timeMin: "2099-06-22T00:00:00-03:00",
+        timeMax: "2099-06-24T00:00:00-03:00",
+      },
+    })) as ToolMessage;
+    expect(out.status).toBe("success");
+    expect(String(out.content).toLowerCase()).toContain("at most 24 hours");
   });
 });

@@ -8,6 +8,7 @@ import {
 } from "@/modules/chatwoot/management";
 import {
   firstAudioAttachment,
+  firstLocationAttachment,
   isHumanAgentMessage,
   isIncomingMessage,
   isNewIncomingMessage,
@@ -16,7 +17,10 @@ import {
 } from "@/modules/chatwoot/normalize";
 import { verifyChatwootSignature } from "@/modules/chatwoot/signing";
 import type { NormalizedChatwootEvent } from "@/modules/chatwoot/types";
-import { runEagerMedia } from "@/modules/chatwoot/webhook";
+import {
+  hasPendingInboundMediaUpdate,
+  runEagerMedia,
+} from "@/modules/chatwoot/webhook";
 
 const sign = (secret: string, ts: number, body: string) =>
   `sha256=${createHmac("sha256", secret).update(`${ts}.${body}`).digest("hex")}`;
@@ -182,6 +186,102 @@ describe("normalizeChatwootEvent", () => {
     expect(normalizeChatwootEvent(null)).toBeNull();
     expect(normalizeChatwootEvent({ foo: 1 })).toBeNull();
   });
+
+  // NOTE: Issue #45 — the fork ships coordinates_lat/coordinates_long/fallback_title on location
+  // attachments (Attachment#location_metadata); the mapper used to drop all three.
+  test("location attachment: coordinates + fallback title survive normalization", () => {
+    const e = normalizeChatwootEvent({
+      event: "message_created",
+      id: 1002,
+      content: "",
+      message_type: "incoming",
+      private: false,
+      attachments: [
+        {
+          id: 31,
+          file_type: "location",
+          coordinates_lat: -23.5505,
+          coordinates_long: -46.6333,
+          fallback_title: "Padaria do Zé, Rua X, 123",
+          data_url: "https://maps.google.com/maps?q=-23.5505,-46.6333",
+        },
+      ],
+      conversation: { id: 42, inbox_id: 7, status: "pending" },
+    });
+    expect(e?.message?.attachments?.[0]).toMatchObject({
+      fileType: "location",
+      latitude: -23.5505,
+      longitude: -46.6333,
+      fallbackTitle: "Padaria do Zé, Rua X, 123",
+    });
+  });
+});
+
+describe("firstLocationAttachment (issue #45)", () => {
+  const loc = (over: Record<string, unknown> = {}) => ({
+    id: 1,
+    fileType: "location",
+    dataUrl: null,
+    latitude: null as number | null,
+    longitude: null as number | null,
+    fallbackTitle: null as string | null,
+    ...over,
+  });
+
+  test("the null island (0,0) without a title is unusable — column defaults, not a real pin", () => {
+    expect(
+      firstLocationAttachment([loc({ latitude: 0, longitude: 0 })]),
+    ).toBeNull();
+  });
+
+  test("(0, non-zero) is a real coordinate", () => {
+    expect(
+      firstLocationAttachment([loc({ latitude: 0, longitude: 9.4 })]),
+    ).toEqual({ latitude: 0, longitude: 9.4, title: null });
+  });
+
+  test("an empty-string title normalizes to null; coordinates stay usable", () => {
+    expect(
+      firstLocationAttachment([
+        loc({ latitude: -23.5, longitude: -46.6, fallbackTitle: "  " }),
+      ]),
+    ).toEqual({ latitude: -23.5, longitude: -46.6, title: null });
+  });
+
+  test("a title-only pin is usable; non-location attachments are skipped", () => {
+    expect(
+      firstLocationAttachment([
+        loc({ fileType: "image" }),
+        loc({ fallbackTitle: "Praça da Sé" }),
+      ]),
+    ).toEqual({ latitude: null, longitude: null, title: "Praça da Sé" });
+  });
+
+  test("no attachments → null", () => {
+    expect(firstLocationAttachment(undefined)).toBeNull();
+    expect(firstLocationAttachment([])).toBeNull();
+  });
+
+  test("boundary coordinates are accepted; out-of-range values are dropped", () => {
+    expect(
+      firstLocationAttachment([loc({ latitude: 90, longitude: 180 })]),
+    ).toEqual({ latitude: 90, longitude: 180, title: null });
+    expect(
+      firstLocationAttachment([loc({ latitude: -90, longitude: -180 })]),
+    ).toEqual({ latitude: -90, longitude: -180, title: null });
+    // Provider garbage: no coordinate survives, the title (when present) still does.
+    expect(
+      firstLocationAttachment([loc({ latitude: 91, longitude: 10 })]),
+    ).toBeNull();
+    expect(
+      firstLocationAttachment([loc({ latitude: 10, longitude: 181 })]),
+    ).toBeNull();
+    expect(
+      firstLocationAttachment([
+        loc({ latitude: -91, longitude: 10, fallbackTitle: "Praça da Sé" }),
+      ]),
+    ).toEqual({ latitude: null, longitude: null, title: "Praça da Sé" });
+  });
 });
 
 describe("isHumanAgentMessage (continuous-ingestion role gate)", () => {
@@ -328,6 +428,82 @@ describe("isNewIncomingMessage (voice-note infinite-loop guard)", () => {
       meta: {},
     });
     expect(conv && isNewIncomingMessage(conv)).toBe(false);
+  });
+});
+
+describe("hasPendingInboundMediaUpdate", () => {
+  const updatedAudio = (transcribedText?: string) =>
+    normalizeChatwootEvent({
+      event: "message_updated",
+      id: 1001,
+      content: "",
+      message_type: "incoming",
+      private: false,
+      attachments: [
+        {
+          id: 77,
+          file_type: "audio",
+          data_url: "https://chat.example.com/a.ogg",
+          ...(transcribedText === undefined
+            ? {}
+            : { transcribed_text: transcribedText }),
+        },
+      ],
+      conversation: {
+        id: 42,
+        inbox_id: 7,
+        status: "pending",
+        meta: { assignee_type: null, assignee: null },
+      },
+    });
+
+  test("accepts an incoming update when the attachment first appears without transcription", () => {
+    const event = updatedAudio();
+    expect(event && hasPendingInboundMediaUpdate(event)).toBe(true);
+  });
+
+  test("rejects the write-back update after transcription and never treats it as a new turn", () => {
+    const event = updatedAudio("áudio já transcrito");
+    expect(event && hasPendingInboundMediaUpdate(event)).toBe(false);
+    expect(event && isNewIncomingMessage(event)).toBe(false);
+  });
+
+  test("rejects outgoing and message_created events", () => {
+    const outgoing = updatedAudio();
+    if (outgoing?.message) outgoing.message.messageType = "outgoing";
+    expect(outgoing && hasPendingInboundMediaUpdate(outgoing)).toBe(false);
+
+    const created = updatedAudio();
+    if (created) created.event = "message_created";
+    expect(created && hasPendingInboundMediaUpdate(created)).toBe(false);
+  });
+
+  test("rejects a visual attachment update (audio-only guard)", () => {
+    // The fork's webhook payload never serializes image_description/extracted_text (only audio
+    // carries transcribed_text), so an image update is indistinguishable from our own vision
+    // write-back re-dispatch (AttachmentsController#update -> send_update_event). Accepting it
+    // would re-run vision on every write-back: a paid call per cycle, forever.
+    const event = normalizeChatwootEvent({
+      event: "message_updated",
+      id: 1002,
+      content: "",
+      message_type: "incoming",
+      private: false,
+      attachments: [
+        {
+          id: 88,
+          file_type: "image",
+          data_url: "https://chat.example.com/img.jpg",
+        },
+      ],
+      conversation: {
+        id: 42,
+        inbox_id: 7,
+        status: "pending",
+        meta: { assignee_type: null, assignee: null },
+      },
+    });
+    expect(event && hasPendingInboundMediaUpdate(event)).toBe(false);
   });
 });
 

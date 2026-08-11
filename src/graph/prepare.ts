@@ -10,10 +10,20 @@ import { runScopedOn, type ScopedDb, type TenantContext } from "@/lib/tenancy";
 import { readLimitsConfig } from "@/modules/agents/limits";
 import { readToolGuidance } from "@/modules/agents/tool-guidance";
 import {
+  buildAppointmentContextSection,
+  loadAppointmentContext,
+} from "@/modules/appointments/context";
+import {
   cancelAppointmentReminders,
   enqueueAppointmentReminders,
 } from "@/modules/appointments/reminders";
 import { parseWindows, type WindowSpec } from "@/modules/business-hours/hours";
+import {
+  attributeBagsFrom,
+  buildAttributeContextSection,
+  isAttributeContextEmpty,
+  readAttributeContextConfig,
+} from "@/modules/chatwoot/attributes";
 import type { ChatwootClient } from "@/modules/chatwoot/client";
 import {
   type KanbanContext,
@@ -40,6 +50,7 @@ import {
 import {
   buildToolpackTools,
   type IntegrationSelection,
+  type SideEffectErrorReporter,
 } from "@/modules/integrations/toolpacks";
 import { type KanbanConfig, readKanbanConfig } from "@/modules/kanban/settings";
 import {
@@ -142,6 +153,10 @@ export interface AgentConfig {
   // The DB Inbox.id this conversation belongs to (null in the playground / no mirror row). Feeds
   // the per-inbox usage attribution on LlmUsage.
   inboxDbId: bigint | null;
+  // NOTE: the inbox's Chatwoot channel class ("Channel::Api", "Channel::Instagram", …; null when unknown
+  // or in the playground). Decides the TTS reply container (pickTtsFormat) — Meta's Instagram
+  // messaging refuses WhatsApp's Ogg/Opus.
+  channelType: string | null;
   contactDbId: bigint | null;
   // The native Chatwoot ContactInbox id (one contact on one channel) for this conversation. Keys the
   // graph memory thread (see resolveGraphThreadId). null on legacy rows / the playground.
@@ -307,6 +322,8 @@ export async function loadAgentConfig(
       );
     }
   }
+  const attributeContext = readAttributeContextConfig(effSettings);
+  const wantsAttributeContext = !isAttributeContextEmpty(attributeContext);
   const conv = await db.conversation.findUnique({
     where: {
       tenantId_chatwootInstanceId_chatwootConversationId: {
@@ -318,6 +335,12 @@ export async function loadAgentConfig(
     select: {
       id: true,
       contactInboxId: true,
+      // NOTE: Mirrored Chatwoot custom attributes (conversation + linked kanban card); the contact's
+      // own bag comes from the relation below. Feed the attribute-context block — no API call. The
+      // three bags are unbounded jsonb, so they are projected ONLY when the agent selected keys:
+      // an agent with the feature off would otherwise pay for them on every single turn.
+      customAttributes: wantsAttributeContext,
+      kanbanAttributes: wantsAttributeContext,
       contact: {
         select: {
           id: true,
@@ -326,9 +349,17 @@ export async function loadAgentConfig(
           email: true,
           phone: true,
           voiceReply: true,
+          customAttributes: wantsAttributeContext,
         },
       },
-      inbox: { select: { id: true, chatwootInboxId: true, name: true } },
+      inbox: {
+        select: {
+          id: true,
+          chatwootInboxId: true,
+          name: true,
+          channelType: true,
+        },
+      },
     },
   });
   // The persona's own Chatwoot Agent Bot for this instance (id for the gate + token to post AS it).
@@ -422,15 +453,74 @@ export async function loadAgentConfig(
         : undefined,
     },
   );
+  // NOTE: The current values of the attribute keys the operator selected, rendered as an XML block
+  // APPENDED to the FINISHED prompt — never interpolated, so a stored value containing
+  // `{{nome_contato}}` stays literal. Values come from the mirror (webhook-fed), so this costs one
+  // already-loaded row and no Chatwoot call. Absent selection / no conversation ⇒ no block.
+  const attributeSection =
+    conv && wantsAttributeContext
+      ? buildAttributeContextSection(
+          attributeBagsFrom({
+            conversationAttributes: conv.customAttributes,
+            contactAttributes: conv.contact?.customAttributes,
+            kanbanAttributes: conv.kanbanAttributes,
+          }),
+          attributeContext,
+          undefined,
+          !sel.nativeToolsAllow ||
+            sel.nativeToolsAllow.includes("set_custom_attribute"),
+        )
+      : null;
+  // NOTE: The LIVE appointments booked in THIS conversation, re-read from the reminder scheduler
+  // rows on EVERY turn — including after the last reminder fired (job DONE, start still ahead), the
+  // exact turn where the customer replies to it. loadAgentConfig is shared by the reactive turn, the
+  // nudge and the debounce flush, so the identity reaches all of them. Playground passes
+  // conversationId 0 ⇒ no block. One bounded DB read; never a Google call.
+  let appointmentSection: string | null = null;
+  if (conv && args.conversationId > 0) {
+    const canOperate = sel.integrationSelections.some(
+      (s) =>
+        s.catalogType === "GOOGLE_CALENDAR" &&
+        s.enabledTools.some((t) =>
+          [
+            "calendar_update_event",
+            "calendar_cancel_event",
+            "calendar_confirm_appointment",
+          ].includes(t),
+        ),
+    );
+    try {
+      appointmentSection = buildAppointmentContextSection(
+        await loadAppointmentContext(
+          db,
+          args.tenantId,
+          chatwootThreadId(args.tenantId, args.instanceId, args.conversationId),
+        ),
+        canOperate,
+      );
+    } catch (e) {
+      // NOTE: Optional context fails OPEN — a read error here must not silence the whole turn.
+      logger.warn(
+        "appointment context load failed: %s",
+        e instanceof Error ? e.message : String(e),
+      );
+    }
+  }
+  const promptSections = [attributeSection, appointmentSection].filter(
+    (s): s is string => s !== null,
+  );
   return {
     agentId: agent.id,
     agentBotId: bot?.chatwootAgentBotId ?? null,
     agentBotToken: bot ? decryptJson<string>(bot.accessToken) : null,
     conversationDbId: conv?.id ?? null,
     inboxDbId: conv?.inbox?.id ?? null,
+    channelType: conv?.inbox?.channelType ?? null,
     contactDbId: conv?.contact?.id ?? null,
     contactInboxId: conv?.contactInboxId ?? null,
-    systemPrompt,
+    systemPrompt: promptSections.length
+      ? `${systemPrompt}\n\n${promptSections.join("\n\n")}`
+      : systemPrompt,
     mc,
     apiKey,
     credentialBaseUrl,
@@ -500,11 +590,13 @@ export interface ToolBuildDeps {
       tenantId?: bigint;
       base?: PrismaClient;
       contactDbId?: bigint | null;
+      conversationDbId?: bigint | null;
       contactVoiceReply?: boolean | null;
       timezone?: string;
       vocab?: ChatwootVocab;
       kanban?: KanbanContext;
       toolInstructions?: Partial<Record<NativeToolName, string>>;
+      onSideEffectError?: SideEffectErrorReporter;
     },
     allowed?: Iterable<string>,
   ) => StructuredToolInterface[];
@@ -541,6 +633,29 @@ export async function buildToolset(
     if (!row) return null;
     return { windows: parseWindows(row.windows), timezone: row.timezone };
   };
+  const flow = deps.flow;
+  // NOTE: A side effect that fails INSIDE a tool that still returns success is invisible in the
+  // tool's own flowlog line (the tool legitimately succeeded for the model). This binding lets toolpacks and
+  // native tools surface those failures as their OWN `tool`-stage warn line (same shape as the MCP
+  // onDiscoverError below): visible in the Logs page, and inbox traffic pages minLevel:warn alert
+  // channels. detail.tool names the trail card; detail.phase discriminates the side effect.
+  const onSideEffectError = flow
+    ? (e: {
+        tool: string;
+        phase: string;
+        detail?: Record<string, unknown>;
+        err: unknown;
+      }) =>
+        emitFlowEvent(flow, {
+          stage: "tool",
+          level: "warn",
+          status: "error",
+          // NOTE: Spread first — the canonical tool/phase discriminators must win over any
+          // caller-supplied detail keys (the Logs page and alerting key on detail.phase).
+          detail: { ...(e.detail ?? {}), tool: e.tool, phase: e.phase },
+          errorMessage: e.err instanceof Error ? e.err.message : String(e.err),
+        })
+    : undefined;
   // Deterministic appointment reminders: when the Calendar toolpack books an appointment, arm one
   // scheduler job per configured offset; cancel them on cancel/reschedule. Bound to the tenant + THIS
   // conversation's thread (the per-conversation `tenant:instance:convId`, which runAgentNudge parses —
@@ -560,6 +675,8 @@ export async function buildToolset(
         credentialRef: string | null;
         offsetsHours: number[];
         askConfirmationOnLast: boolean;
+        summary: string | null;
+        calendarLabel: string | null;
       }) => {
         try {
           await enqueueAppointmentReminders({
@@ -571,6 +688,8 @@ export async function buildToolset(
             startISO: a.startISO,
             offsetsHours: a.offsetsHours,
             askConfirmationOnLast: a.askConfirmationOnLast,
+            summary: a.summary,
+            calendarLabel: a.calendarLabel,
             base: ctx.base,
           });
         } catch (e) {
@@ -578,6 +697,15 @@ export async function buildToolset(
             "appointment reminders enqueue failed: %s",
             e instanceof Error ? e.message : String(e),
           );
+          // NOTE: The appointment exists in Google but its reminders were never armed — the customer
+          // silently misses them. `google_calendar` is the toolpack family name (the closure does not
+          // know which calendar tool called it).
+          onSideEffectError?.({
+            tool: "google_calendar",
+            phase: "reminders_enqueue",
+            detail: { eventId: a.eventId },
+            err: e,
+          });
         }
       }
     : undefined;
@@ -590,6 +718,12 @@ export async function buildToolset(
             "appointment reminders cancel failed: %s",
             e instanceof Error ? e.message : String(e),
           );
+          onSideEffectError?.({
+            tool: "google_calendar",
+            phase: "reminders_cancel",
+            detail: { eventId },
+            err: e,
+          });
         }
       }
     : undefined;
@@ -612,7 +746,6 @@ export async function buildToolset(
           }
         }
       : undefined;
-  const flow = deps.flow;
   const mcpTools = await loadMcpToolsForAgent(ctx.tenantId, cfg.mcpSelections, {
     // Default google_oauth refresh (overridable by tests via deps.mcp). Resolves the entry id from
     // the `vault:<id>` ref and returns a fresh access token, refreshing via Google when stale.
@@ -648,6 +781,7 @@ export async function buildToolset(
     resolveBusinessHours,
     scheduleAppointmentReminders,
     cancelAppointmentReminders: cancelAppointmentRemindersFn,
+    onSideEffectError,
     // Only a real conversation gets the live handle (mirrors the emitAck gate); the playground
     // builds with conversationId 0 + a stub client, so customer-delivery tools degrade.
     ...(ctx.conversationId > 0
@@ -757,11 +891,13 @@ export async function buildToolset(
         tenantId: ctx.tenantId,
         base: ctx.base,
         contactDbId: cfg.contactDbId,
+        conversationDbId: cfg.conversationDbId,
         contactVoiceReply: cfg.contactVoiceReply,
         timezone: cfg.timezone,
         vocab,
         kanban,
         toolInstructions,
+        onSideEffectError,
       },
       cfg.nativeToolsAllow,
     ),

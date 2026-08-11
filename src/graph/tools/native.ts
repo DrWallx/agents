@@ -3,6 +3,7 @@ import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
+import { failableTool, toolFailure } from "@/graph/tools/failure";
 import { runScopedOn, type TenantContext } from "@/lib/tenancy";
 import { xmlAttr, xmlEscape } from "@/lib/xml";
 import type {
@@ -19,6 +20,7 @@ import {
   type HandoffTargets,
   matchHandoffTarget,
 } from "@/modules/handoff/targets";
+import type { SideEffectErrorReporter } from "@/modules/integrations/toolpacks";
 import { emitOutbound } from "@/modules/webhooks/outbound/service";
 import {
   DEFAULT_TIMEZONE,
@@ -72,6 +74,10 @@ export interface ToolCtx {
   tenantId?: bigint;
   base?: PrismaClient;
   contactDbId?: bigint | null;
+  // NOTE: Our Conversation row id, for the write-through that keeps the mirrored attribute bags in
+  // step right after set_custom_attribute writes to Chatwoot (see mirrorAttributeWrite). Absent ⇒
+  // the write-through is skipped and the mirror catches up on the next webhook event.
+  conversationDbId?: bigint | null;
   // The contact's CURRENT stored voice preference (snapshot at turn prep), surfaced in the
   // set_voice_preference description so the model knows the existing value before changing it.
   // true = audio, false = text, null/undefined = not set yet.
@@ -92,6 +98,11 @@ export interface ToolCtx {
   // model-facing description so transfer/funnel logic lives WITH the tool instead of buried in the
   // prompt. Populated at turn prep from agent.settings (handoff.instructions / kanban.instructions).
   toolInstructions?: Partial<Record<NativeToolName, string>>;
+  // NOTE: Reports a side effect that failed INSIDE a tool that still returns success to the model
+  // (e.g. the handoff happened but the assignment failed). prepare.ts binds this to a flowlog
+  // `tool`-stage warn so the failure reaches the Logs page and alert channels; absent
+  // (playground/tests) ⇒ the failure stays log-only. NEVER changes the tool's return value.
+  onSideEffectError?: SideEffectErrorReporter;
 }
 
 // Assembles a tool's final model-facing description in a fixed order: the static capability text,
@@ -181,6 +192,11 @@ function handoffTool(ctx: ToolCtx) {
             String(ctx.conversationId),
             e instanceof Error ? e.message : String(e),
           );
+          ctx.onSideEffectError?.({
+            tool: "handoff_to_human",
+            phase: "customer_message",
+            err: e,
+          });
         }
       }
       // Transfer-with-summary: a private note for the human BEFORE handing off, gated by the
@@ -240,6 +256,12 @@ function handoffTool(ctx: ToolCtx) {
           String(ctx.conversationId),
           e instanceof Error ? e.message : String(e),
         );
+        ctx.onSideEffectError?.({
+          tool: "handoff_to_human",
+          phase: "assign",
+          detail: { mode },
+          err: e,
+        });
       }
       return `Handed off to a human (status set to open).${assigned} The bot will stay silent now.`;
     },
@@ -340,6 +362,84 @@ function knownAttributesXml(
   return `<known_attributes>\n${blocks.join("\n")}\n</known_attributes>`;
 }
 
+// NOTE: Write-through of a just-written attribute into OUR mirrored bag, so the attribute-context
+// block (built from the mirror at turn prep) reflects it immediately. Chatwoot is still the source
+// of truth: the next webhook event overwrites the bag wholesale. This only closes the window where a
+// proactive nudge — which is not preceded by an inbound event — would otherwise read a stale value,
+// and it matters most for the contact scope (Chatwoot does not deliver contact_updated to bots).
+//
+// The merge is a single `jsonb || jsonb` UPDATE rather than a read-modify-write: a turn can emit
+// several set_custom_attribute calls and the tool node runs them CONCURRENTLY, so a read-then-write
+// would let two calls on the same scope clobber each other's key. Postgres takes the row lock for
+// the duration of the statement, so the distinct keys both survive.
+// Best-effort: any failure is logged and swallowed, never surfaced to the model.
+async function mirrorAttributeWrite(
+  ctx: ToolCtx,
+  scope: "conversation" | "contact" | "task",
+  key: string,
+  value: string,
+): Promise<void> {
+  if (!ctx.base || ctx.tenantId == null) return;
+  const base = ctx.base;
+  const tenantId = ctx.tenantId;
+  const patch = JSON.stringify({ [key]: value });
+  try {
+    await runScopedOn(base, sysCtx(tenantId), async (db) => {
+      if (scope === "contact") {
+        if (ctx.contactDbId == null) return;
+        // NOTE: The write-through also ADVANCES the contact's source watermark. Chatwoot accepted
+        // this key a moment ago, so every event generated before now carries a pre-write snapshot —
+        // and one of those, delivered late but still stamped after the last mirrored event, would
+        // otherwise pass upsertContact's compare-and-set and replace the whole bag, erasing the key
+        // we just wrote. It matters here and not on the conversation scopes because agent bots
+        // never get contact_updated, so nothing would put the key back. GREATEST (which ignores
+        // NULL) keeps it from moving backwards if Chatwoot's clock runs ahead of ours.
+        //
+        // `AT TIME ZONE 'UTC'` is load-bearing: the column is TIMESTAMP (no zone) holding UTC, and
+        // bare NOW() is timestamptz. Mixing them makes GREATEST resolve through the SESSION
+        // TimeZone, which nothing here pins — under a non-UTC session the stored value reads as
+        // offset-hours in the future and wins, so the barrier silently never advances.
+        await db.$executeRaw`
+          UPDATE contacts
+          SET custom_attributes = custom_attributes || ${patch}::jsonb,
+              custom_attributes_at = GREATEST(
+                custom_attributes_at,
+                (NOW() AT TIME ZONE 'UTC')
+              )
+          WHERE id = ${ctx.contactDbId} AND tenant_id = ${tenantId}
+        `;
+        return;
+      }
+      if (ctx.conversationDbId == null) return;
+      if (scope === "task") {
+        await db.$executeRaw`
+          UPDATE conversations
+          SET kanban_attributes = kanban_attributes || ${patch}::jsonb
+          WHERE id = ${ctx.conversationDbId} AND tenant_id = ${tenantId}
+        `;
+        return;
+      }
+      await db.$executeRaw`
+        UPDATE conversations
+        SET custom_attributes = custom_attributes || ${patch}::jsonb
+        WHERE id = ${ctx.conversationDbId} AND tenant_id = ${tenantId}
+      `;
+    });
+  } catch (e) {
+    logger.warn(
+      "attribute mirror write-through failed (scope=%s): %s",
+      scope,
+      e instanceof Error ? e.message : String(e),
+    );
+    ctx.onSideEffectError?.({
+      tool: "set_custom_attribute",
+      phase: "mirror_write",
+      detail: { scope, key },
+      err: e,
+    });
+  }
+}
+
 // Set a custom attribute on the conversation OR the contact. The valid keys (and list values) of
 // each scope are enumerated in the description from the account's definitions (ctx.vocab), so the
 // model writes a KNOWN key instead of inventing one. Contact scope resolves the Chatwoot contact id
@@ -376,6 +476,7 @@ function setCustomAttributeTool(ctx: ToolCtx) {
         await ctx.client.setKanbanTaskCustomAttributes(ctx.kanban.taskId, {
           [key]: value,
         });
+        await mirrorAttributeWrite(ctx, "task", key, value);
         return `Task attribute ${key} set.`;
       }
       if (scope === "contact") {
@@ -396,11 +497,13 @@ function setCustomAttributeTool(ctx: ToolCtx) {
         await ctx.client.setContactCustomAttributes(contact.chatwootContactId, {
           [key]: value,
         });
+        await mirrorAttributeWrite(ctx, "contact", key, value);
         return `Contact attribute ${key} set.`;
       }
       await ctx.client.setConversationCustomAttributes(ctx.conversationId, {
         [key]: value,
       });
+      await mirrorAttributeWrite(ctx, "conversation", key, value);
       return `Conversation attribute ${key} set.`;
     },
     {
@@ -657,6 +760,12 @@ function kanbanMoveTool(ctx: ToolCtx) {
             "outbound emit failed (event=kanban.card_moved): %s",
             err instanceof Error ? err.message : String(err),
           );
+          ctx.onSideEffectError?.({
+            tool: "kanban_move_card",
+            phase: "outbound_emit",
+            detail: { event: "kanban.card_moved" },
+            err,
+          });
         }
       }
       return `Moved the card to "${step.name}".`;
@@ -756,6 +865,65 @@ function updateKanbanTaskTool(ctx: ToolCtx) {
   );
 }
 
+// Updates the current customer's name after they explicitly state or correct it. Chatwoot remains
+// the source of truth; the local mirror is updated immediately so the next prompt sees the new name.
+function setContactNameTool(ctx: ToolCtx) {
+  return tool(
+    async ({ name }: { name: string }) => {
+      const normalized = name.trim().replace(/\s+/g, " ");
+      if (!ctx.tenantId || !ctx.base || !ctx.contactDbId) {
+        return "The contact is not mirrored, so the name could not be updated.";
+      }
+      const contactDbId = ctx.contactDbId;
+
+      const contact = await runScopedOn(ctx.base, sysCtx(ctx.tenantId), (db) =>
+        db.contact.findUnique({
+          where: { id: contactDbId },
+          select: { chatwootContactId: true },
+        }),
+      );
+      if (!contact?.chatwootContactId) {
+        return "The contact no longer exists in Chatwoot.";
+      }
+
+      await ctx.client.updateContact(contact.chatwootContactId, {
+        name: normalized,
+      });
+      await runScopedOn(ctx.base, sysCtx(ctx.tenantId), (db) =>
+        db.contact.updateMany({
+          where: { id: contactDbId },
+          data: { name: normalized },
+        }),
+      );
+      return `Contact name updated to "${normalized}".`;
+    },
+    {
+      name: "set_contact_name",
+      description: withOperatorNote(
+        "Update the current customer's name in Chatwoot after the customer explicitly states or corrects their own name. Use the full name exactly as provided, without inventing a surname. Do not call when the current contact name is already reliable, when the text is only a greeting, or when the apparent name belongs to someone else.",
+        ctx,
+        "set_contact_name",
+      ),
+      schema: z.object({
+        name: z
+          .string()
+          .trim()
+          .min(2)
+          .max(120)
+          .refine((value) => /[\p{L}]/u.test(value), {
+            message: "name must contain at least one letter",
+          })
+          .refine((value) => !/^\+?[\d\s().-]+$/.test(value), {
+            message: "name must not be a phone number",
+          })
+          .describe(
+            "Customer name exactly as explicitly provided by the customer.",
+          ),
+      }),
+    },
+  );
+}
+
 // Records the customer's audio-vs-text reply preference on the Contact (TTS "preference" mode). A
 // DB write (RLS-scoped), not a Chatwoot call — the elegant replacement for the n8n custom attribute.
 function setVoicePreferenceTool(ctx: ToolCtx) {
@@ -804,7 +972,7 @@ function setVoicePreferenceTool(ctx: ToolCtx) {
 // reacting with the same emoji again removes it. Pair with skip_reply when a reaction is the whole
 // response (e.g. the customer sent just "ok"/👍).
 function reactToMessageTool(ctx: ToolCtx) {
-  return tool(
+  return failableTool(
     async ({ emoji }: { emoji: string }) => {
       const e = emoji.trim();
       if (!e) return "Provide an emoji to react with.";
@@ -823,7 +991,7 @@ function reactToMessageTool(ctx: ToolCtx) {
         await ctx.client.addMessageReaction(ctx.conversationId, latest.id, e);
         return `Reacted with ${e} to the customer's last message.`;
       } catch {
-        return "Could not add the reaction.";
+        return toolFailure("Could not add the reaction.");
       }
     },
     {
@@ -936,6 +1104,7 @@ export function buildNativeTools(
     kanbanMoveTool(ctx),
     updateKanbanTaskTool(ctx),
     setVoicePreferenceTool(ctx),
+    setContactNameTool(ctx),
     reactToMessageTool(ctx),
     skipReplyTool(ctx),
     calculatorTool(ctx),

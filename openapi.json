@@ -544,6 +544,11 @@
         "summary": "Current session and auth state",
         "description": "Returns the authenticated user (or null when anonymous) plus auth state flags: setupRequired, setupTokenRequired, signupEnabled, providers, and the default tenant id. Safe to call without a session.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "Session and auth state. `user` is null when anonymous; the flags describe setup, signup and provider availability."
+          }
+        },
         "operationId": "getAuthMe"
       }
     },
@@ -915,6 +920,27 @@
         "summary": "Log out",
         "description": "Clears the authentication cookie for the current session.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "The auth cookie was cleared.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "success": {
+                      "const": true,
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "success"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "operationId": "postAuthLogout"
       }
     },
@@ -1046,6 +1072,80 @@
         "summary": "Liveness & DB health",
         "description": "Public health probe. Returns the app name/version plus a database connectivity check (status \"degraded\" if the DB is unreachable). No authentication.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "Liveness report. Always 200 — a DB outage is reported as status \"degraded\", not as an error status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "name": {
+                      "description": "Application name.",
+                      "type": "string"
+                    },
+                    "version": {
+                      "description": "Application version.",
+                      "type": "string"
+                    },
+                    "status": {
+                      "description": "\"ok\", or \"degraded\" when the database is unreachable.",
+                      "anyOf": [
+                        {
+                          "const": "ok",
+                          "type": "string"
+                        },
+                        {
+                          "const": "degraded",
+                          "type": "string"
+                        }
+                      ]
+                    },
+                    "db": {
+                      "description": "Database connectivity check result.",
+                      "anyOf": [
+                        {
+                          "type": "object",
+                          "properties": {
+                            "ok": {
+                              "const": true,
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "ok"
+                          ]
+                        },
+                        {
+                          "type": "object",
+                          "properties": {
+                            "ok": {
+                              "const": false,
+                              "type": "boolean"
+                            },
+                            "error": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "ok",
+                            "error"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "version",
+                    "status",
+                    "db"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "operationId": "getHealth"
       }
     },
@@ -1057,6 +1157,30 @@
         "summary": "List available locales",
         "description": "Returns the language codes for which translation resources are loaded.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "The loaded locale codes.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "languages": {
+                      "type": "array",
+                      "items": {
+                        "description": "Locale code (e.g. pt-BR).",
+                        "type": "string"
+                      }
+                    }
+                  },
+                  "required": [
+                    "languages"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "operationId": "getI18nLocales"
       }
     },
@@ -2079,6 +2203,11 @@
         "summary": "Get global branding",
         "description": "Returns the resolved global identity: colors, which asset variants exist, and the cache version. Public so it can load before any auth context.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "The resolved global branding: brand name, color mode and tokens, which logo/favicon variants exist, and the cache-busting version."
+          }
+        },
         "operationId": "getV1Branding"
       },
       "patch": {
@@ -4948,8 +5077,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5020,8 +5148,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5092,8 +5219,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5381,8 +5507,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5454,8 +5579,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -5527,8 +5651,7 @@
                     "type": "string"
                   },
                   "systemPrompt": {
-                    "maxLength": 50000,
-                    "description": "System prompt template, may contain {{variable}} placeholders.",
+                    "description": "System prompt template, may contain {{variable}} placeholders (up to 100000 characters).",
                     "type": "string"
                   },
                   "enabled": {
@@ -6807,7 +6930,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -6874,7 +6997,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -6941,7 +7064,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7232,7 +7355,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7291,7 +7414,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7350,7 +7473,7 @@
                     "type": "object",
                     "properties": {
                       "systemPrompt": {
-                        "maxLength": 50000,
+                        "maxLength": 100000,
                         "type": "string"
                       },
                       "modelConfig": {
@@ -7527,7 +7650,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7594,7 +7717,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7661,7 +7784,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7847,7 +7970,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -7926,7 +8049,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8005,7 +8128,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8195,7 +8318,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8262,7 +8385,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8329,7 +8452,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8515,7 +8638,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8598,7 +8721,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -8681,7 +8804,7 @@
                         "type": "object",
                         "properties": {
                           "systemPrompt": {
-                            "maxLength": 50000,
+                            "maxLength": 100000,
                             "type": "string"
                           },
                           "modelConfig": {
@@ -11413,6 +11536,7 @@
             "in": "path",
             "required": true,
             "schema": {
+              "description": "MCP connection id (BigInt serialized as a decimal string).",
               "type": "string"
             }
           },
@@ -11601,6 +11725,84 @@
             }
           }
         },
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "operationId": "patchV1Mcp-connectionsById"
       },
       "delete": {
@@ -11615,6 +11817,7 @@
             "in": "path",
             "required": true,
             "schema": {
+              "description": "MCP connection id (BigInt serialized as a decimal string).",
               "type": "string"
             }
           },
@@ -11630,6 +11833,84 @@
             "example": "1"
           }
         ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "operationId": "deleteV1Mcp-connectionsById"
       }
     },
@@ -11756,6 +12037,7 @@
             "in": "path",
             "required": true,
             "schema": {
+              "description": "MCP connection id (BigInt serialized as a decimal string).",
               "type": "string"
             }
           },
@@ -11771,6 +12053,84 @@
             "example": "1"
           }
         ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "operationId": "postV1Mcp-connectionsByIdDiscover"
       }
     },
@@ -15057,6 +15417,38 @@
         "summary": "Google OAuth callback",
         "description": "Public popup redirect target for the Google consent flow; cookie-authenticated in-handler and bound by the signed state, it always returns HTML so the popup can postMessage the result to its opener and self-close.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "HTML page that posts the successful result to the opener window and self-closes.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "HTML page reporting a failed flow (provider error, missing or expired state, token exchange failure) without leaking internals.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "HTML page reporting an unauthenticated caller or a state/user mismatch.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "parameters": [
           {
             "name": "code",
@@ -15476,6 +15868,38 @@
         "summary": "MCP OAuth callback",
         "description": "Public popup redirect target for the MCP consent flow; cookie-authenticated in-handler and bound by the signed state, it always returns HTML so the popup can postMessage the result to its opener and self-close.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "HTML page that posts the successful result to the opener window and self-closes.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "HTML page reporting a failed flow (provider error, missing or expired state, token exchange failure) without leaking internals.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "HTML page reporting an unauthenticated caller or a state/user mismatch.",
+            "content": {
+              "text/html": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "parameters": [
           {
             "name": "code",
@@ -18502,8 +18926,93 @@
           "Integrations"
         ],
         "summary": "Generic inbound webhook",
-        "description": "Public inbound receptor for integrations (n8n-style webhook node); authenticated by the opaque per-instance route token plus the per-instance auth strategy (e.g. HMAC or static header, verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast and always returns 200 to avoid leaking auth state.",
+        "description": "Public inbound receptor for integrations (n8n-style webhook node); authenticated by the opaque per-instance route token plus the per-instance auth strategy (e.g. HMAC or static header, verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast (<5s) and dispatches asynchronously; an unknown token and failed auth collapse into the same 401, so a probe cannot tell which routes are live.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "Returned once the caller is authenticated; `outcome` says what happened to the delivery.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ack": {
+                      "const": true,
+                      "type": "boolean"
+                    },
+                    "outcome": {
+                      "description": "queued = accepted for async dispatch; duplicate = replay of an already-recorded delivery; ignored = deliberately-unhandled lifecycle event; no-mapper = the integration has no inbound mapper registered; invalid = the payload failed the mapper schema (recorded for inspection).",
+                      "anyOf": [
+                        {
+                          "const": "queued",
+                          "type": "string"
+                        },
+                        {
+                          "const": "duplicate",
+                          "type": "string"
+                        },
+                        {
+                          "const": "ignored",
+                          "type": "string"
+                        },
+                        {
+                          "const": "no-mapper",
+                          "type": "string"
+                        },
+                        {
+                          "const": "invalid",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "ack",
+                    "outcome"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "parameters": [
           {
             "name": "routeToken",
@@ -18807,7 +19316,7 @@
           "Integrations"
         ],
         "summary": "List integration instances",
-        "description": "Returns the tenant's configured integration instances; the routeToken is never returned after creation.",
+        "description": "Returns the tenant's configured integration instances. The routeToken is omitted here; read a single instance to get it.",
         "responses": {
           "401": {
             "description": "Unauthorized — missing or invalid credentials.",
@@ -18868,7 +19377,7 @@
           "Integrations"
         ],
         "summary": "Create integration instance",
-        "description": "Creates an integration instance and returns its id plus the opaque routeToken, which is shown only once and never returned again.",
+        "description": "Creates an integration instance and returns its id plus the opaque routeToken for the inbound webhook URL. The token stays readable afterwards via GET /instances/:id.",
         "requestBody": {
           "required": true,
           "content": {
@@ -19141,7 +19650,7 @@
           "Integrations"
         ],
         "summary": "Get integration instance",
-        "description": "Fetches a single integration instance by id; the routeToken is never returned after creation.",
+        "description": "Fetches a single integration instance by id, including its inbound routeToken (null when the entry has no inbound surface, or when the instance predates token storage — rotate to mint a readable one).",
         "parameters": [
           {
             "name": "id",
@@ -19249,7 +19758,7 @@
           "Integrations"
         ],
         "summary": "Update integration instance",
-        "description": "Updates fields of an integration instance by id; the routeToken is never returned after creation.",
+        "description": "Updates fields of an integration instance by id. The routeToken is not returned here; read the instance or rotate it.",
         "parameters": [
           {
             "name": "id",
@@ -19626,6 +20135,116 @@
           }
         },
         "operationId": "deleteV1IntegrationsInstancesById"
+      }
+    },
+    "/v1/integrations/instances/{id}/route-token": {
+      "post": {
+        "tags": [
+          "Integrations"
+        ],
+        "summary": "Rotate inbound route token",
+        "description": "Mints a new inbound webhook token for the instance and returns it. The previous URL stops working immediately, so the provider's dashboard must be updated.",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Integration instance id (BigInt serialized as a string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Not found.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Not found.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "postV1IntegrationsInstancesByIdRoute-token"
       }
     },
     "/v1/knowledge/bases": {
@@ -23858,6 +24477,36 @@
         "summary": "MCP SSE stream (not offered)",
         "description": "Always 405 with `Allow: POST`. This transport is stateless and tools-only, so the OPTIONAL server-to-client SSE stream does not exist; the route is declared so a probing client gets an explicit 405 instead of falling through to the SPA 404 guard and reconnecting in a loop.",
         "security": [],
+        "responses": {
+          "405": {
+            "description": "Always returned: this transport does not offer the method (`Allow: POST`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Error response.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "description": "Human-readable error message.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Allow": {
+                "description": "Always `POST`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "operationId": "getV1Mcp"
       },
       "delete": {
@@ -23867,6 +24516,36 @@
         "summary": "MCP session teardown (not offered)",
         "description": "Always 405 with `Allow: POST`. The transport is stateless, so there is no session to tear down; declared for the same reason as the GET above.",
         "security": [],
+        "responses": {
+          "405": {
+            "description": "Always returned: this transport does not offer the method (`Allow: POST`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Error response.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "description": "Human-readable error message.",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Allow": {
+                "description": "Always `POST`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
         "operationId": "deleteV1Mcp"
       }
     },
@@ -25000,8 +25679,85 @@
           "Channels"
         ],
         "summary": "Chatwoot bot webhook",
-        "description": "Public Agent Bot webhook receiver; authenticated by the opaque per-instance route token plus the HMAC signature header (verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast and always returns 200 to avoid leaking auth state.",
+        "description": "Public Agent Bot webhook receiver; authenticated by the opaque per-instance route token plus the HMAC signature header (verified in-handler after tenant resolution), not by a session cookie or bearer. Acks fast (<5s) and processes asynchronously; an unknown token and a bad signature collapse into the same 401, so a probe cannot tell which routes are live.",
         "security": [],
+        "responses": {
+          "200": {
+            "description": "Returned once the caller is authenticated; `outcome` says what happened to the event.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ack": {
+                      "const": true,
+                      "type": "boolean"
+                    },
+                    "outcome": {
+                      "description": "queued = accepted for async handling; duplicate = replay of an already-recorded event; ignored = an event shape the receiver does not handle.",
+                      "anyOf": [
+                        {
+                          "const": "queued",
+                          "type": "string"
+                        },
+                        {
+                          "const": "duplicate",
+                          "type": "string"
+                        },
+                        {
+                          "const": "ignored",
+                          "type": "string"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "ack",
+                    "outcome"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
         "parameters": [
           {
             "name": "routeToken",
@@ -26927,6 +27683,97 @@
           }
         },
         "operationId": "getV1ChatwootLabelsByAgentId"
+      }
+    },
+    "/v1/chatwoot/custom-attributes/{agentId}": {
+      "get": {
+        "tags": [
+          "Channels"
+        ],
+        "summary": "List custom attribute definitions",
+        "description": "List Chatwoot custom attribute definitions available to an agent's inboxes.",
+        "parameters": [
+          {
+            "name": "agentId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "description": "Agent id (BigInt string).",
+              "type": "string"
+            }
+          },
+          {
+            "name": "x-tenant-id",
+            "in": "header",
+            "required": true,
+            "description": "SUPER_ADMIN tenant selector (tenant id as a string). Picks the target tenant for this request; ignored for non-super-admin principals, who are pinned to their own tenant. Not truly required — prefilled and marked required here only so Scalar sends it by default.",
+            "schema": {
+              "type": "string",
+              "default": "1"
+            },
+            "example": "1"
+          }
+        ],
+        "responses": {
+          "400": {
+            "description": "Bad request — validation failed or the input was malformed.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Bad request — validation failed or the input was malformed.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized — missing or invalid credentials.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Unauthorized — missing or invalid credentials.",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "description": "Forbidden — authenticated but not allowed (role or tenant gate).",
+                  "type": "object",
+                  "properties": {
+                    "error": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "error"
+                  ]
+                }
+              }
+            }
+          }
+        },
+        "operationId": "getV1ChatwootCustom-attributesByAgentId"
       }
     },
     "/v1/chatwoot/inboxes/{id}": {
