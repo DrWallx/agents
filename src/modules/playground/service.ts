@@ -1,5 +1,5 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { HumanMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import { type StructuredToolInterface, tool } from "@langchain/core/tools";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
@@ -7,6 +7,10 @@ import logger from "@/api/lib/logger";
 import basePrisma from "@/api/lib/prisma";
 import { lastAssistantText } from "@/graph/graph";
 import type { ResolvedModelConfig } from "@/graph/models";
+import {
+  applyDeterministicResponsePolicy,
+  requiredNameReply,
+} from "@/graph/prompt";
 import {
   type AgentNudge,
   FOLLOWUP_SKIP_SENTINEL,
@@ -416,6 +420,26 @@ export async function runPlaygroundTurn(
     ? new HumanMessage({ content: text, id: humanId })
     : new HumanMessage(text);
 
+  const nameReply = requiredNameReply({
+    systemPrompt: loaded.systemPrompt,
+    contactName: loaded.contactName,
+    customerMessage: text,
+  });
+  if (nameReply) {
+    await graph.updateState(
+      { configurable: { thread_id: threadId } },
+      { messages: [human, new AIMessage(nameReply)] },
+    );
+    await upsertPlaygroundSession(
+      base,
+      tenantId,
+      agentId,
+      threadId,
+      params.titleHint ?? text,
+    );
+    return { reply: nameReply, threadId, trace: [], sources: [] };
+  }
+
   let result: Awaited<ReturnType<typeof graph.invoke>>;
   try {
     result = await withFlowStage(
@@ -438,7 +462,35 @@ export async function runPlaygroundTurn(
     throw toPlaygroundInvokeError(e);
   }
   const trace = buildPlaygroundTrace(result.messages, traceLabels);
-  const reply = lastAssistantText(result.messages).trim();
+  const policyResult = applyDeterministicResponsePolicy({
+    systemPrompt: loaded.systemPrompt,
+    reply: lastAssistantText(result.messages),
+  });
+  const reply = policyResult.reply;
+  if (
+    policyResult.requiresHandoff &&
+    !trace.some(
+      (entry) =>
+        entry.type === "tool_call" && entry.name === "handoff_to_human",
+    )
+  ) {
+    const id = `automatic-handoff-${crypto.randomUUID()}`;
+    trace.push({
+      type: "tool_call",
+      id,
+      name: "handoff_to_human",
+      args: { reason: "Encaminhamento automático pela política de resposta." },
+    });
+    trace.push({
+      type: "tool_result",
+      id,
+      name: "handoff_to_human",
+      output:
+        "[simulated] automatic handoff — no real effect in the playground.",
+      isError: false,
+      simulated: true,
+    });
+  }
   await upsertPlaygroundSession(
     base,
     tenantId,
