@@ -52,6 +52,8 @@ function sysCtx(tenantId: bigint): TenantContext {
 // takeover and discard the reply — and the reply would reopen the conversation anyway).
 export interface TurnState {
   resolveRequested: boolean;
+  handoffPerformed?: boolean;
+  automaticHandoffRequested?: boolean;
 }
 
 export interface ToolCtx {
@@ -207,6 +209,7 @@ function handoffTool(ctx: ToolCtx) {
       // Set status `open` → the conversation leaves `pending`, so the attribution gate stops the
       // bot and the human queue picks it up.
       await ctx.client.toggleStatus(ctx.conversationId, "open");
+      if (ctx.turnState) ctx.turnState.handoffPerformed = true;
 
       // Optional targeting (best-effort: the handoff already happened, so an assignment failure must
       // not break the turn). In `route` mode nothing is assigned (Chatwoot routes).
