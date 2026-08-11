@@ -1,5 +1,5 @@
 import type { BaseChatModel } from "@langchain/core/language_models/chat_models";
-import { HumanMessage } from "@langchain/core/messages";
+import { AIMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import type { PrismaClient } from "@/../generated/prisma/client";
 import logger from "@/api/lib/logger";
@@ -35,6 +35,10 @@ import { lastAssistantText } from "./graph";
 import { clearTurnInFlight, markTurnInFlight } from "./inflight";
 import { CONVERSATION_DIVIDER } from "./ingest";
 import { createChatModel, type ResolvedModelConfig } from "./models";
+import {
+  applyDeterministicResponsePolicy,
+  requiredNameReply,
+} from "./prompt";
 import {
   type AgentConfig,
   buildCallbacks,
@@ -148,6 +152,48 @@ async function applyDeferredResolve(
       level: "warn",
       status: "error",
       detail: { outcome: "resolved" },
+      errorMessage: msg,
+    });
+  }
+}
+
+async function applyAutomaticHandoff(
+  client: ChatwootClient,
+  conversationId: number,
+  turnState: TurnState,
+  flow: FlowContext,
+): Promise<void> {
+  if (
+    !turnState.automaticHandoffRequested ||
+    turnState.handoffPerformed
+  ) {
+    return;
+  }
+  turnState.automaticHandoffRequested = false;
+  try {
+    await client.sendPrivateNote(
+      conversationId,
+      "Encaminhamento automático: a resposta específica não estava disponível no conhecimento aprovado.",
+    );
+    await client.toggleStatus(conversationId, "open");
+    turnState.handoffPerformed = true;
+    emitFlowEvent(flow, {
+      stage: "handoff",
+      status: "ok",
+      detail: { outcome: "automatic_policy" },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    logger.warn(
+      "automatic handoff failed (conv=%s): %s",
+      String(conversationId),
+      msg,
+    );
+    emitFlowEvent(flow, {
+      stage: "handoff",
+      level: "warn",
+      status: "error",
+      detail: { outcome: "automatic_policy" },
       errorMessage: msg,
     });
   }
@@ -361,6 +407,26 @@ export async function runLoadedTurn(
   // of nudging mid-turn (cleared in the finally on every exit). See ./inflight.
   markTurnInFlight(threadId);
   try {
+    const nameReply = requiredNameReply({
+      systemPrompt: loaded.systemPrompt,
+      contactName: loaded.contactName,
+      customerMessage: turnText,
+    });
+    if (nameReply) {
+      await graph.updateState(
+        { configurable: { thread_id: graphThreadId } },
+        {
+          messages: [
+            new HumanMessage(turnText),
+            new AIMessage(nameReply),
+          ],
+        },
+      );
+      await client.sendMessage(conversationId, nameReply);
+      deliveredBalloons = 1;
+      return "posted";
+    }
+
     // INPUT guardrail: screen the customer message BEFORE the agent processes it. On a violation,
     // send the configured template / a guardrails-generated safe reply and skip the graph, or stay
     // silent (send nothing). null ⇒ nothing tripped, proceed as normal.
@@ -465,6 +531,14 @@ export async function runLoadedTurn(
       if (outGuard.reply === null) return "blocked";
       reply = outGuard.reply;
     }
+    const policyResult = applyDeterministicResponsePolicy({
+      systemPrompt: loaded.systemPrompt,
+      reply,
+    });
+    reply = policyResult.reply;
+    if (policyResult.requiresHandoff && !turnState.handoffPerformed) {
+      turnState.automaticHandoffRequested = true;
+    }
 
     // Reply modality: audio (TTS) per the agent's mode + the customer's modality/preference, else
     // text. TTS is best-effort — any synthesis failure falls back to a text reply, never drops it.
@@ -544,6 +618,7 @@ export async function runLoadedTurn(
     );
     deliveredBalloons = balloons;
     await applyDeferredResolve(client, conversationId, turnState, flow);
+    await applyAutomaticHandoff(client, conversationId, turnState, flow);
     return "posted";
   } finally {
     clearTurnInFlight(threadId);
