@@ -34,16 +34,16 @@ const DETERMINISTIC_POLICY_MARKER =
 const REQUIRED_NAME_REPLY =
   "Para eu cuidar melhor do seu atendimento, qual é o seu nome?";
 const URGENT_CUSTOMER_MESSAGE =
-  /\\b(?:urg[eê]ncia|emerg[eê]ncia|passando mal|efeito colateral|rea[cç][aã]o|falta de ar|desmai|dor (?:forte|intensa)|sangramento)\\b/i;
+  /\b(?:urg[eê]ncia|emerg[eê]ncia|passando mal|efeito colateral|rea[cç][aã]o|falta de ar|desmai|dor (?:forte|intensa)|sangramento)\b/i;
 const EXPLICIT_CUSTOMER_NAME =
-  /\\b(?:meu nome [ée]|sou|pode me chamar de)\\s+([\\p{L}][\\p{L}'’-]*(?:\\s+[\\p{L}][\\p{L}'’-]*){0,5})/iu;
-const PHONE_LIKE_NAME = /^\\+?[\\d\\s().-]{8,}$/;
+  /\b(?:meu nome [ée]|sou|pode me chamar de)\s+([\p{L}][\p{L}'’-]*(?:\s+[\p{L}][\p{L}'’-]*){0,5})/iu;
+const PHONE_LIKE_NAME = /^\+?[\d\s().-]{8,}$/;
 const KNOWLEDGE_INTERNAL =
-  /\\b(?:base(?: de dados| de conhecimento)?|rag|banco de dados|sistema|busca)\\b/i;
+  /\b(?:base(?: de dados| de conhecimento)?|rag|banco de dados|sistema|busca)\b/i;
 const MISSING_KNOWLEDGE =
-  /\\b(?:n[aã]o (?:traz|tem|informa|consta|encontr)|sem informa[cç][aã]o|aus[eê]ncia de informa[cç][aã]o)\\b/i;
+  /\b(?:n[aã]o (?:traz|tem|informa|consta|encontr)|sem informa[cç][aã]o|aus[eê]ncia de informa[cç][aã]o)\b/i;
 const HANDOFF_PROMISE =
-  /\\b(?:vou|irei)\\s+(?:repassar|encaminhar).{0,160}\\bequipe\\b|\\bequipe\\b.{0,160}\\b(?:responder|continuar|dar continuidade)\\b/is;
+  /\b(?:vou|irei)\s+(?:repassar|encaminhar).{0,160}\bequipe\b|\bequipe\b.{0,160}\b(?:responder|continuar|dar continuidade)\b/is;
 
 export function usesDeterministicResponsePolicy(
   systemPrompt: string,
@@ -55,7 +55,7 @@ export function isReliableContactName(
   value: string | null | undefined,
 ): boolean {
   const name = value?.trim() ?? "";
-  return !!name && !PHONE_LIKE_NAME.test(name) && /\\p{L}/u.test(name);
+  return !!name && !PHONE_LIKE_NAME.test(name) && /\p{L}/u.test(name);
 }
 
 export function explicitNameFromMessage(text: string): string | null {
@@ -77,7 +77,7 @@ export function requiredNameReply(params: {
 function dedupeRepeatedLines(reply: string): string {
   const lines = reply
     .trim()
-    .split(/\\r?\\n/)
+    .split(/\r?\n/)
     .map((line) => line.trim())
     .filter(Boolean);
   if (lines.length < 2 || lines.length % 2 !== 0) return reply.trim();
@@ -85,21 +85,21 @@ function dedupeRepeatedLines(reply: string): string {
   const left = lines.slice(0, half);
   const right = lines.slice(half);
   return left.every((line, index) => line === right[index])
-    ? left.join("\\n")
+    ? left.join("\n")
     : reply.trim();
 }
 
 function removeKnowledgeInternals(reply: string): string {
   const chunks = reply
     .trim()
-    .split(/(?<=[.!?])\\s+|\\r?\\n+/)
+    .split(/(?<=[.!?])\s+|\r?\n+/)
     .map((chunk) => chunk.trim())
     .filter(Boolean);
   const kept = chunks.filter(
     (chunk) =>
       !(KNOWLEDGE_INTERNAL.test(chunk) && MISSING_KNOWLEDGE.test(chunk)),
   );
-  return kept.join("\\n").trim();
+  return kept.join("\n").trim();
 }
 
 export function applyDeterministicResponsePolicy(params: {
