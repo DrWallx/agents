@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { buildPromptVars, interpolatePromptVars } from "@/graph/prompt";
+import {
+  applyDeterministicResponsePolicy,
+  buildPromptVars,
+  explicitNameFromMessage,
+  interpolatePromptVars,
+  requiredNameReply,
+} from "@/graph/prompt";
 
 describe("interpolatePromptVars — {{ }} syntax", () => {
   const vars = buildPromptVars({
