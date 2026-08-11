@@ -99,6 +99,7 @@ function removeKnowledgeInternals(reply: string): string {
     (chunk) =>
       !(KNOWLEDGE_INTERNAL.test(chunk) && MISSING_KNOWLEDGE.test(chunk)),
   );
+  if (kept.length === chunks.length) return reply.trim();
   return kept.join("\n").trim();
 }
 
